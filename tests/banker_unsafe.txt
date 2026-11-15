@@ -1,0 +1,19 @@
+# Banker's algorithm - UNSAFE state
+# Same allocation and max claims as banker_safe.txt, but the lab has fewer
+# free units: Available = (2 1 1). P3, P1 and P2 can finish, after which
+# Work = (9 2 4) can satisfy neither P0 (needs 7 4 3) nor P4 (needs 4 3 1).
+processes 5
+resources 3
+available 2 1 1
+allocation
+0 1 0
+2 0 0
+3 0 2
+2 1 1
+0 0 2
+max
+7 5 3
+3 2 2
+9 0 2
+2 2 2
+4 3 3

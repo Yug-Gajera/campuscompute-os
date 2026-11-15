@@ -1,0 +1,5 @@
+build/
+campuscompute
+logs/
+*.zip
+*.o

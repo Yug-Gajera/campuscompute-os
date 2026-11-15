@@ -1,0 +1,7 @@
+# Tie-breaking test: equal arrivals and equal priorities, plus an idle gap
+# job_id  arrival  cpu_burst  priority
+4   0   3   2
+2   0   4   2
+7   0   2   1
+9   12  3   1
+5   12  1   1

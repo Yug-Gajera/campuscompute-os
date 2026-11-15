@@ -1,0 +1,10 @@
+# Invalid: allocation exceeds max for P1
+processes 2
+resources 2
+available 1 1
+allocation
+1 0
+5 1
+max
+2 2
+3 3
