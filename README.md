@@ -102,7 +102,7 @@ greater than Max is rejected.
   Core dumps are disabled in the aborting worker so no core file is left behind.
 * **Resource limits (FR7)**: limits are set in child processes only, so the shell and
   main program are unaffected. `RLIMIT_CPU` 1 s → SIGXCPU; `RLIMIT_FSIZE` 4096 B →
-  `write()` fails with EFBIG; `RLIMIT_AS` 64 MiB → 256 MiB `malloc` returns NULL.
+  `write()` fails with EFBIG; `RLIMIT_AS` = current size + 64 MiB → a 256 MiB `mmap` is refused with ENOMEM.
 
 ## Cleanup
 

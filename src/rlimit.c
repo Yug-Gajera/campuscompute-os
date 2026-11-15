@@ -9,8 +9,8 @@
  *   fsize RLIMIT_FSIZE soft limit 4096 bytes. The child ignores SIGXFSZ and
  *         writes 1 KiB blocks to a temporary file; the write that would cross
  *         4096 bytes fails with EFBIG. The temporary file is deleted afterwards.
- *   mem   RLIMIT_AS 64 MiB. A 16 MiB allocation succeeds; a 256 MiB
- *         allocation is refused (malloc returns NULL).
+ *   mem   RLIMIT_AS = current address-space size + 64 MiB. A further 16 MiB
+ *         mapping succeeds; a 256 MiB mapping is refused by the kernel (ENOMEM).
  */
 #include "campus.h"
 
@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -117,24 +118,48 @@ static void child_fsize(void)
 static void child_mem(void)
 {
     show_limit("child", "RLIMIT_AS before", RLIMIT_AS);
-    if (set_limit(RLIMIT_AS, 64UL << 20, 64UL << 20) != 0) _exit(10);
+    /*
+     * RLIMIT_AS caps the TOTAL virtual address space, which already includes
+     * the program, libraries and thread stacks/arenas inherited from the parent.
+     * So the cap is set to (current size + 64 MiB): 64 MiB of headroom.
+     */
+    unsigned long cur_kb = 0;
+    FILE *st = fopen("/proc/self/status", "r");
+    if (st) {
+        char line[128];
+        while (fgets(line, sizeof line, st))
+            if (sscanf(line, "VmSize: %lu kB", &cur_kb) == 1) break;
+        fclose(st);
+    }
+    rlim_t cap = ((rlim_t)cur_kb << 10) + (64UL << 20);
+    printf("    [child pid %d] current address space %lu KiB -> cap = current + 64 MiB\n",
+           (int)getpid(), cur_kb);
+    if (set_limit(RLIMIT_AS, cap, cap) != 0) _exit(10);
     show_limit("child", "RLIMIT_AS after ", RLIMIT_AS);
 
     /*
-     * 'volatile' stops the optimiser from deleting these malloc()/free() pairs.
-     * Newer GCC versions (15+) at -O2 may otherwise remove an allocation whose
-     * memory is never used and assume it succeeded, hiding the limit's effect.
+     * Memory is requested with mmap() directly rather than malloc(): it is a
+     * real system call, so the compiler cannot optimise it away (newer GCC
+     * versions may delete an unused malloc()/free() pair and assume success).
      */
-    void *volatile small = malloc(16UL << 20);
-    printf("    [child pid %d] malloc(16 MiB)  -> %s\n", (int)getpid(), small ? "succeeded" : "FAILED");
-    if (small) memset(small, 1, 16UL << 20);
-    void *volatile big = malloc(256UL << 20);
-    printf("    [child pid %d] malloc(256 MiB) -> %s\n", (int)getpid(),
-           big ? "succeeded (limit not enforced here)" : "refused, returned NULL (ENOMEM)");
+    size_t small_len = 16UL << 20, big_len = 256UL << 20;
+    void *small = mmap(NULL, small_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (small != MAP_FAILED) memset(small, 1, small_len);       /* really use it */
+    printf("    [child pid %d] mmap(16 MiB)  -> %s\n", (int)getpid(),
+           small != MAP_FAILED ? "succeeded" : strerror(errno));
+
+    void *big = mmap(NULL, big_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int big_errno = errno;
+    if (big == MAP_FAILED)
+        printf("    [child pid %d] mmap(256 MiB) -> refused: %s (errno %d = ENOMEM? %s)\n", (int)getpid(),
+               strerror(big_errno), big_errno, big_errno == ENOMEM ? "yes" : "no");
+    else
+        printf("    [child pid %d] mmap(256 MiB) -> succeeded (limit not enforced here)\n", (int)getpid());
     fflush(stdout);
-    int ok = small != NULL && big == NULL;
-    free(small);
-    free(big);
+
+    int ok = small != MAP_FAILED && big == MAP_FAILED;
+    if (small != MAP_FAILED) munmap(small, small_len);
+    if (big != MAP_FAILED) munmap(big, big_len);
     _exit(ok ? 0 : 12);
 }
 
@@ -205,10 +230,10 @@ int rlimit_command(const char *which)
     }
     if (mem) {
         ran++;
-        int bad = run_one("RLIMIT_AS = 64 MiB", child_mem, 0) != 0;
+        int bad = run_one("RLIMIT_AS = current size + 64 MiB", child_mem, 0) != 0;
         fails += bad;
         printf(bad ? "  Effect NOT observed as expected on this system.\n"
-                   : "  Observed effect: allocations beyond the address-space cap fail, protecting other users' memory.\n");
+                   : "  Observed effect: memory requests beyond the address-space cap fail, protecting other users' memory.\n");
     }
     printf("\n  Parent limit unchanged afterwards:\n");
     show_limit("parent", "RLIMIT_CPU", RLIMIT_CPU);
