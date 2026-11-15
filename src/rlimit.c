@@ -120,10 +120,15 @@ static void child_mem(void)
     if (set_limit(RLIMIT_AS, 64UL << 20, 64UL << 20) != 0) _exit(10);
     show_limit("child", "RLIMIT_AS after ", RLIMIT_AS);
 
-    void *small = malloc(16UL << 20);
+    /*
+     * 'volatile' stops the optimiser from deleting these malloc()/free() pairs.
+     * Newer GCC versions (15+) at -O2 may otherwise remove an allocation whose
+     * memory is never used and assume it succeeded, hiding the limit's effect.
+     */
+    void *volatile small = malloc(16UL << 20);
     printf("    [child pid %d] malloc(16 MiB)  -> %s\n", (int)getpid(), small ? "succeeded" : "FAILED");
     if (small) memset(small, 1, 16UL << 20);
-    void *big = malloc(256UL << 20);
+    void *volatile big = malloc(256UL << 20);
     printf("    [child pid %d] malloc(256 MiB) -> %s\n", (int)getpid(),
            big ? "succeeded (limit not enforced here)" : "refused, returned NULL (ENOMEM)");
     fflush(stdout);
