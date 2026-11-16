@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Count IPC objects in /dev/shm whose name ends in THIS run's PID. */
 static int our_ipc_objects_in_devshm(void)
 {
     DIR *d = opendir("/dev/shm");
@@ -29,6 +30,12 @@ static int our_ipc_objects_in_devshm(void)
     return n;
 }
 
+/*
+ * Integrated demo: one run that exercises every requirement on the same job
+ * set, with the logger thread recording events from all stages, then checks
+ * cleanup and prints PASS/FAIL per requirement. Each pass[] flag is set only
+ * from the real result of that step - nothing is hard-coded.
+ */
 int demo_run(const char *jobfile, const char *bankfile)
 {
     const char *names[8] = { "FR1 Job management", "FR2 CPU scheduling", "FR3 Threaded logger",
@@ -102,6 +109,7 @@ int demo_run(const char *jobfile, const char *bankfile)
         int w = n < 6 ? n : 6;
         for (int i = 0; i < w; i++) {
             snprintf(specs[i].label, sizeof specs[i].label, "job-J%d", jobs[i].id);
+            /* one worker per job; the last one deliberately fails so FR6 has something to detect */
             specs[i].mode = i == w - 1 ? W_FAIL_EXIT : W_NORMAL;
             specs[i].work_units = jobs[i].burst > 5 ? 5 : jobs[i].burst;
         }
@@ -143,6 +151,10 @@ int demo_run(const char *jobfile, const char *bankfile)
     printf("  Threads left in process : %d\n", threads);
     printf("  Un-reaped child processes: %s\n", kids ? "none" : "SOME");
     printf("  IPC objects left by this run in /dev/shm: %d\n", ipc);
+    /*
+     * FR7 passes only if the limit worked AND nothing is left behind: just the
+     * main thread, no un-reaped children, and no IPC objects from this run.
+     */
     pass[6] = rl_ok && threads == 1 && kids && ipc == 0;
 
     /* ---- summary ---- */

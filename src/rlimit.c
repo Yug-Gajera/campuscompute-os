@@ -27,6 +27,10 @@
 
 #define FSIZE_TMP "logs/rlimit_fsize_test.tmp"
 
+/*
+ * Print a resource's current SOFT limit (what is enforced now) and HARD limit
+ * (the ceiling the soft limit may be raised to).
+ */
 static void show_limit(const char *who, const char *name, int res)
 {
     struct rlimit rl;
@@ -39,6 +43,7 @@ static void show_limit(const char *who, const char *name, int res)
     printf("    [%s pid %d] %s soft=%s hard=%s\n", who, (int)getpid(), name, s, h);
 }
 
+/* Apply new soft/hard limits to THIS process with setrlimit(). */
 static int set_limit(int res, rlim_t soft, rlim_t hard)
 {
     struct rlimit rl = { soft, hard };
@@ -51,6 +56,11 @@ static int set_limit(int res, rlim_t soft, rlim_t hard)
 
 /* ---- child bodies ---------------------------------------------------------- */
 
+/*
+ * CPU-time limit. Soft 1 s, hard 2 s. The child just burns CPU in a loop;
+ * once it has USED 1 s of CPU time (not wall time) the kernel sends SIGXCPU,
+ * whose default action terminates the process. A runaway job is stopped.
+ */
 static void child_cpu(void)
 {
     struct rlimit no_core = { 0, 0 };
@@ -83,6 +93,10 @@ static void child_fsize(void)
     int fd = open(FSIZE_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd == -1) { perror("open"); _exit(11); }
 
+    /*
+     * Lower only the SOFT limit to 4096 bytes. Because the hard limit is unchanged,
+     * the child may raise the soft limit back afterwards to print its report.
+     */
     struct rlimit lim = { 4096, orig.rlim_max };  /* soft 4096 bytes, hard unchanged */
     if (setrlimit(RLIMIT_FSIZE, &lim) == -1) { perror("setrlimit"); close(fd); unlink(FSIZE_TMP); _exit(10); }
     struct rlimit during;
@@ -115,6 +129,11 @@ static void child_fsize(void)
     _exit(total == 4096 ? 0 : 12);
 }
 
+/*
+ * Address-space limit. RLIMIT_AS caps the total virtual memory a process may
+ * map. Requests beyond the cap fail with ENOMEM instead of eating memory
+ * that other lab users need.
+ */
 static void child_mem(void)
 {
     show_limit("child", "RLIMIT_AS before", RLIMIT_AS);
@@ -148,6 +167,7 @@ static void child_mem(void)
     printf("    [child pid %d] mmap(16 MiB)  -> %s\n", (int)getpid(),
            small != MAP_FAILED ? "succeeded" : strerror(errno));
 
+    /* this request would push us past the cap -> the kernel must refuse it */
     void *big = mmap(NULL, big_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     int big_errno = errno;
     if (big == MAP_FAILED)
@@ -165,6 +185,14 @@ static void child_mem(void)
 
 /* ---- parent side ------------------------------------------------------------- */
 
+/*
+ * PARENT side of each demonstration: fork a child that applies the limit
+ * itself (so the parent and the user's shell keep their normal limits),
+ * wait for it, and check that it ended the way the limit predicts:
+ *   CPU   -> killed by SIGXCPU
+ *   FSIZE -> exited 0 after seeing EFBIG at 4096 bytes
+ *   AS    -> exited 0 after the big request was refused
+ */
 static int run_one(const char *name, void (*body)(void), int expect_signal)
 {
     printf("\n  --- %s ---\n", name);
@@ -198,6 +226,10 @@ static int run_one(const char *name, void (*body)(void), int expect_signal)
     return ok ? 0 : -1;
 }
 
+/*
+ * 'rlimit [cpu|fsize|mem|all]' - run the chosen demonstrations and report
+ * how many behaved as expected.
+ */
 int rlimit_command(const char *which)
 {
     int cpu = !strcmp(which, "cpu") || !strcmp(which, "all");

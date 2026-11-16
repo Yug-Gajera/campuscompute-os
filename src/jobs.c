@@ -42,6 +42,10 @@ void jobs_reset(Job *jobs, int count)
     }
 }
 
+/*
+ * Validate one numeric field; on failure print exactly which field on which
+ * line was wrong and what value was found.
+ */
 static int check_field(const char *path, int lineno, const char *name,
                        const char *tok, int min, int max, int *out)
 {
@@ -52,6 +56,11 @@ static int check_field(const char *path, int lineno, const char *name,
     return -1;
 }
 
+/*
+ * Read a job file line by line. Every problem is reported (not just the first)
+ * and counted; if there is ANY error the whole file is rejected, so a
+ * scheduler never runs on partly-valid data.
+ */
 int jobs_load(const char *path, Job *jobs, int *count)
 {
     FILE *fp = fopen(path, "r");
@@ -65,6 +74,7 @@ int jobs_load(const char *path, Job *jobs, int *count)
 
     while (fgets(line, sizeof line, fp) != NULL) {
         lineno++;
+        /* fgets() stopped before the newline -> the line is longer than our buffer */
         if (strchr(line, '\n') == NULL && !feof(fp)) {
             fprintf(stderr, "  %s:%d: line too long\n", path, lineno);
             errors++;
@@ -72,6 +82,7 @@ int jobs_load(const char *path, Job *jobs, int *count)
             while ((c = fgetc(fp)) != '\n' && c != EOF) { }
             continue;
         }
+        /* cut off a '#' comment, then split the rest into fields on spaces/tabs/commas */
         char *hash = strchr(line, '#');
         if (hash) *hash = '\0';
 
@@ -84,6 +95,7 @@ int jobs_load(const char *path, Job *jobs, int *count)
 
         if (ntok == 0)
             continue;                         /* blank or comment-only line */
+        /* every job line must have exactly: id arrival burst priority */
         if (ntok != 4) {
             fprintf(stderr, "  %s:%d: expected 4 fields <id> <arrival> <burst> <priority>, found %d\n",
                     path, lineno, ntok);
@@ -99,12 +111,17 @@ int jobs_load(const char *path, Job *jobs, int *count)
         Job j;
         memset(&j, 0, sizeof j);
         int bad = 0;
+        /*
+         * Range checks. Using |= runs all four checks, so one line can report
+         * several bad fields at once.
+         */
         bad |= check_field(path, lineno, "job ID",       tok[0], 1, 999999, &j.id);
         bad |= check_field(path, lineno, "arrival time", tok[1], 0, MAX_ARRIVAL, &j.arrival);
         bad |= check_field(path, lineno, "CPU burst",    tok[2], 1, MAX_BURST, &j.burst);
         bad |= check_field(path, lineno, "priority",     tok[3], 0, MAX_PRIORITY, &j.priority);
         if (bad) { errors++; continue; }
 
+        /* job IDs must be unique, otherwise results could not be told apart */
         for (int k = 0; k < n; k++) {
             if (jobs[k].id == j.id) {
                 fprintf(stderr, "  %s:%d: duplicate job ID %d\n", path, lineno, j.id);
@@ -118,6 +135,7 @@ int jobs_load(const char *path, Job *jobs, int *count)
     }
     fclose(fp);
 
+    /* reject the whole file if anything was wrong; otherwise every job starts as NEW */
     if (errors > 0) {
         fprintf(stderr, "error: '%s' rejected - %d invalid line(s). Nothing was scheduled.\n",
                 path, errors);

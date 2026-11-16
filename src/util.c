@@ -19,6 +19,10 @@ int parse_int(const char *text, int min, int max, int *out)
 {
     if (text == NULL || *text == '\0')
         return -1;
+    /*
+     * strtol sets errno on overflow and 'end' to the first character it could
+     * not convert, so "5x" or "" are rejected instead of silently read as 5 or 0.
+     */
     errno = 0;
     char *end = NULL;
     long v = strtol(text, &end, 10);

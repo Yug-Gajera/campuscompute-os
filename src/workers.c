@@ -35,6 +35,7 @@ const char *worker_mode_name(WorkerMode m)
     case W_NORMAL:      return "normal";
     case W_FAIL_EXIT:   return "sim-exit(3)";
     case W_FAIL_SIGNAL: return "sim-abort";
+    /* Simulates a stuck job: it never exits, so only the parent's watchdog can end it. */
     case W_FAIL_HANG:   return "sim-hang";
     }
     return "?";
@@ -53,6 +54,11 @@ static int count_primes(int limit)
     return count;
 }
 
+/*
+ * CHILD PROCESS body. Every worker first does real computation, then behaves
+ * according to its mode. Children always leave with _exit() (or a signal), so
+ * they never return into the parent's code.
+ */
 static void worker_main(const WorkerSpec *w)
 {
     int limit = 20000 * (w->work_units > 0 ? w->work_units : 1);
@@ -67,6 +73,10 @@ static void worker_main(const WorkerSpec *w)
         printf("    [%-8s pid %d] [SIMULATED FAILURE] exiting with status 3\n", w->label, (int)getpid());
         fflush(stdout);
         _exit(3);
+    /*
+     * abort() raises SIGABRT, an ABNORMAL termination. RLIMIT_CORE = 0 first, so
+     * the kernel does not write a core-dump file into the user's folder.
+     */
     case W_FAIL_SIGNAL: {
         struct rlimit no_core = { 0, 0 };
         setrlimit(RLIMIT_CORE, &no_core);          /* never leave a core file behind */
@@ -82,6 +92,10 @@ static void worker_main(const WorkerSpec *w)
     _exit(0);
 }
 
+/*
+ * PARENT: fork() one child per worker, then supervise them all.
+ * Returns how many workers were actually started.
+ */
 int workers_run(const WorkerSpec *specs, int n, double timeout_s, WorkerReport *out)
 {
     double started[MAX_JOBS];
@@ -91,6 +105,10 @@ int workers_run(const WorkerSpec *specs, int n, double timeout_s, WorkerReport *
         memset(&out[i], 0, sizeof out[i]);
         fflush(stdout);
         fflush(stderr);
+        /*
+         * fork() returns twice: 0 in the new child, the child's PID in the parent,
+         * or -1 if no process could be created.
+         */
         pid_t pid = fork();
         if (pid == -1) {
             fprintf(stderr, "error: fork() for %s failed: %s\n", specs[i].label, strerror(errno));
@@ -108,6 +126,12 @@ int workers_run(const WorkerSpec *specs, int n, double timeout_s, WorkerReport *
     }
 
     /* supervision loop: reap finished children, kill hung ones */
+    /*
+     * SUPERVISION LOOP. waitpid(pid, &status, WNOHANG) checks a child WITHOUT
+     * blocking: it returns 0 if the child is still running, or the PID once it has
+     * ended (and reaps it, so no zombie is left). Polling all children every 20 ms
+     * lets the parent also enforce the watchdog timeout at the same time.
+     */
     int remaining = launched;
     while (remaining > 0) {
         for (int i = 0; i < launched; i++) {
@@ -121,6 +145,10 @@ int workers_run(const WorkerSpec *specs, int n, double timeout_s, WorkerReport *
                 remaining--;
                 continue;
             }
+            /*
+             * Still running. If it has run longer than the timeout we treat it as hung
+             * and send SIGKILL; the next waitpid() will then report 'killed by signal 9'.
+             */
             if (r == 0) {                           /* still running */
                 if (now_seconds() - started[i] > timeout_s && !out[i].timed_out) {
                     printf("    [parent   pid %d] watchdog: %s pid %d silent for %.1fs -> sending SIGKILL\n",
@@ -132,6 +160,11 @@ int workers_run(const WorkerSpec *specs, int n, double timeout_s, WorkerReport *
             }
             out[i].finished = 1;
             out[i].seconds  = now_seconds() - started[i];
+            /*
+             * Decode HOW the child ended:
+             *   WIFEXITED   -> it called exit/_exit; WEXITSTATUS gives the code (0 = success)
+             *   WIFSIGNALED -> it was killed by a signal; WTERMSIG gives which one
+             */
             if (WIFEXITED(status)) {
                 out[i].exit_code    = WEXITSTATUS(status);
                 out[i].completed_ok = out[i].exit_code == 0;
@@ -156,6 +189,7 @@ int workers_run(const WorkerSpec *specs, int n, double timeout_s, WorkerReport *
     return launched;
 }
 
+/* Turn a worker's report into the human-readable status shown in the table. */
 static void describe(const WorkerSpec *s, const WorkerReport *r, char *buf, size_t len)
 {
     const char *tag = s->mode == W_NORMAL ? "" : " [SIMULATED]";
@@ -172,6 +206,11 @@ static void describe(const WorkerSpec *s, const WorkerReport *r, char *buf, size
 }
 
 /* Print the per-worker report table; returns number of failures detected. */
+/*
+ * Print one row per worker and a summary, then prove that no child process
+ * is left behind: waitpid(-1, ..., WNOHANG) failing with ECHILD means this
+ * process has no children at all.
+ */
 static int print_report(const WorkerSpec *specs, const WorkerReport *rep, int n)
 {
     int ok = 0, failed = 0, simulated = 0;
@@ -194,6 +233,10 @@ static int print_report(const WorkerSpec *specs, const WorkerReport *rep, int n)
     return failed;
 }
 
+/*
+ * 'workers normal [n]' or 'workers fail [exit|signal|hang|all]'.
+ * fail mode always runs one NORMAL worker too, so both outcomes are compared.
+ */
 int workers_command(int argc, char **argv)
 {
     /* argv[0] = "workers", argv[1] = normal|fail, argv[2] optional */
@@ -250,6 +293,7 @@ int workers_command(int argc, char **argv)
     workers_run(specs, n, 2.0, rep);
     int failed = print_report(specs, rep, n);
 
+    /* PASS only if the parent detected exactly the failures we deliberately caused. */
     int correct = failed == expect_failures;
     printf("  Result: %s\n", correct ? "PASS - every worker outcome was detected and reported correctly"
                                      : "FAIL - unexpected worker outcome");

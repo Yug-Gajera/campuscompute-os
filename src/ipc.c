@@ -31,13 +31,24 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/*
+ * Only 3 slots for 5 jobs on purpose: the submitter fills the buffer and must
+ * wait on sem_empty, which shows the semaphores actually coordinating.
+ */
 #define SLOTS 3
 
+/* One message passed through shared memory: a job's fields, or an END marker. */
 typedef struct {
     int id, arrival, burst, priority;
     int last;                       /* 1 = end-of-stream marker */
 } JobMsg;
 
+/*
+ * Layout of the shared-memory region. Both child processes mmap() the SAME
+ * physical pages, so a write by one is immediately visible to the other.
+ * It contains only plain values (no pointers), because each process may map
+ * the region at a different virtual address.
+ */
 typedef struct {
     /* ring buffer written by submitter, read by dispatcher */
     JobMsg slot[SLOTS];
@@ -54,6 +65,7 @@ typedef struct {
     char shm[64], empty[64], full[64], mutex[64];
 } IpcNames;
 
+/* sem_wait() can be interrupted by a signal (errno EINTR); just try again. */
 static int sem_wait_retry(sem_t *s)
 {
     while (sem_wait(s) == -1) {
@@ -63,6 +75,11 @@ static int sem_wait_retry(sem_t *s)
 }
 
 /* wait, but announce when we are actually going to block */
+/*
+ * Try the semaphore without blocking first (sem_trywait). If that fails with
+ * EAGAIN the process is about to block, so we print it - this is how the
+ * output shows 'blocked on sem_empty' - and then really wait.
+ */
 static int sem_wait_verbose(sem_t *s, const char *who, const char *semname, int verbose)
 {
     if (sem_trywait(s) == 0)
@@ -76,6 +93,15 @@ static int sem_wait_verbose(sem_t *s, const char *who, const char *semname, int 
     return sem_wait_retry(s);
 }
 
+/*
+ * SUBMITTER (child process 1) - the producer side of the bounded buffer:
+ *   sem_wait(empty)  wait for a free slot
+ *   sem_wait(mutex)  lock the head/tail indices
+ *   write the job into slot[tail], advance tail
+ *   sem_post(mutex)  unlock
+ *   sem_post(full)   tell the dispatcher one more slot is filled
+ * After all jobs it sends an END marker, then exits with status 0.
+ */
 static void submitter(SharedRegion *r, sem_t *empty, sem_t *full, sem_t *mutex,
                       const Job *jobs, int n, int verbose)
 {
@@ -108,6 +134,12 @@ static void submitter(SharedRegion *r, sem_t *empty, sem_t *full, sem_t *mutex,
     _exit(0);
 }
 
+/*
+ * DISPATCHER (child process 2) - the consumer side, the mirror image:
+ *   sem_wait(full) -> lock -> read slot[head] -> unlock -> sem_post(empty)
+ * It adds up what it receives and finally writes a summary into shared memory
+ * so the parent can verify that nothing was lost or reordered.
+ */
 static void dispatcher(SharedRegion *r, sem_t *empty, sem_t *full, sem_t *mutex, int verbose)
 {
     int  received = 0;
@@ -153,11 +185,17 @@ static void dispatcher(SharedRegion *r, sem_t *empty, sem_t *full, sem_t *mutex,
     _exit(0);
 }
 
+/*
+ * POSIX shm objects appear as /dev/shm/<name> and named semaphores as
+ * /dev/shm/sem.<name> on Linux, so checking those files tells us whether
+ * an IPC object still exists.
+ */
 static int object_exists(const char *devpath)
 {
     return access(devpath, F_OK) == 0;
 }
 
+/* Decode a waitpid() status: normal exit (with its code) or killed by a signal. */
 static int describe_child(const char *who, pid_t pid, int status)
 {
     if (WIFEXITED(status)) {
@@ -170,10 +208,16 @@ static int describe_child(const char *who, pid_t pid, int status)
     return -1;
 }
 
+/*
+ * PARENT: create the IPC objects, fork the two children, wait for them,
+ * check their results, and finally remove everything it created.
+ * The 'goto cleanup' pattern makes sure objects are removed on ANY error.
+ */
 int ipc_run(const Job *jobs, int n, int verbose)
 {
     IpcNames nm;
     pid_t me = getpid();
+    /* Names include our PID (e.g. /campuscompute_shm_4242) so two runs never clash. */
     snprintf(nm.shm,   sizeof nm.shm,   "/" IPC_PREFIX "shm_%d", (int)me);
     snprintf(nm.empty, sizeof nm.empty, "/" IPC_PREFIX "sem_empty_%d", (int)me);
     snprintf(nm.full,  sizeof nm.full,  "/" IPC_PREFIX "sem_full_%d", (int)me);
@@ -195,12 +239,15 @@ int ipc_run(const Job *jobs, int n, int verbose)
     /* 1. create shared memory - O_EXCL guarantees we never reuse someone else's object */
     fd = shm_open(nm.shm, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd == -1) { fprintf(stderr, "error: shm_open(%s): %s\n", nm.shm, strerror(errno)); goto cleanup; }
+    /* a new shm object has size 0 -> give it the size of our struct */
     if (ftruncate(fd, sizeof(SharedRegion)) == -1) { perror("error: ftruncate"); goto cleanup; }
+    /* MAP_SHARED: changes are shared with every process that maps this object */
     r = mmap(NULL, sizeof(SharedRegion), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (r == MAP_FAILED) { perror("error: mmap"); goto cleanup; }
     memset(r, 0, sizeof *r);
 
     /* 2. create semaphores */
+    /* empty = SLOTS (all slots free), full = 0 (nothing to read), mutex = 1 (unlocked) */
     se = sem_open(nm.empty, O_CREAT | O_EXCL, 0600, SLOTS);
     sf = sem_open(nm.full,  O_CREAT | O_EXCL, 0600, 0);
     sm = sem_open(nm.mutex, O_CREAT | O_EXCL, 0600, 1);
@@ -223,6 +270,11 @@ int ipc_run(const Job *jobs, int n, int verbose)
     /* 3. fork the two cooperating processes */
     fflush(stdout);
     fflush(stderr);
+    /*
+     * Flush stdout before fork() so buffered text is not printed twice, then
+     * create the two children. Each child inherits the mapping and semaphores.
+     * The child functions end with _exit(), so they never return here.
+     */
     sub = fork();
     if (sub == -1) { perror("error: fork(submitter)"); goto cleanup; }
     if (sub == 0) submitter(r, se, sf, sm, jobs, n, verbose);
@@ -234,6 +286,7 @@ int ipc_run(const Job *jobs, int n, int verbose)
     /* 4. wait for both and check results */
     int st_sub = 0, st_dis = 0;
     pid_t sub_pid = sub, dis_pid = dis;
+    /* wait for BOTH children (reaping them, so no zombie processes remain) */
     if (waitpid(sub, &st_sub, 0) == -1) perror("waitpid(submitter)");
     sub = -1;
     if (waitpid(dis, &st_dis, 0) == -1) perror("waitpid(dispatcher)");
@@ -242,6 +295,11 @@ int ipc_run(const Job *jobs, int n, int verbose)
     describe_child("submitter", sub_pid, st_sub);
     describe_child("dispatcher", dis_pid, st_dis);
 
+    /*
+     * The parent computes the expected result itself and compares it with what
+     * the dispatcher wrote into shared memory: same count, same total burst,
+     * same order (FIFO).
+     */
     long expect_total = 0;
     for (int i = 0; i < n; i++) expect_total += jobs[i].burst;
     int order_ok = 1;
@@ -258,6 +316,11 @@ int ipc_run(const Job *jobs, int n, int verbose)
     logger_log("IPC", "transfer %s: %d jobs, burst total %ld", ok ? "OK" : "FAILED",
                r->received, r->burst_total);
 
+/*
+ * CLEANUP (reached on success and on every error): kill/reap any child still
+ * running, unmap and close the shared memory, close the semaphores, then
+ * shm_unlink/sem_unlink to delete the objects from the system.
+ */
 cleanup:
     /* 5. reap any child still alive after an error, then remove only OUR objects */
     if (sub > 0) { kill(sub, SIGTERM); waitpid(sub, NULL, 0); }
@@ -276,6 +339,7 @@ cleanup:
 
     char p[256];
     snprintf(p, sizeof p, "/dev/shm%s", nm.shm);
+    /* verify: after unlinking, none of our objects may still exist in /dev/shm */
     leftovers += object_exists(p);
     for (int i = 0; i < 3; i++) {
         snprintf(p, sizeof p, "/dev/shm/sem.%s", sems[i] + 1);

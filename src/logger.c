@@ -29,6 +29,10 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * One log record. It is copied INTO the buffer by a producer and copied OUT
+ * by the consumer, so no pointers are shared between threads.
+ */
 typedef struct {
     long  seq;
     char  when[32];
@@ -37,6 +41,16 @@ typedef struct {
     char  text[200];
 } LogEntry;
 
+/*
+ * All shared state of the logger lives in this one struct 'L'.
+ *   buf / head / tail / count : the bounded circular buffer
+ *     - producers write at 'tail', the consumer reads at 'head'
+ *     - 'count' = how many entries are waiting (0 = empty, capacity = full)
+ *   mutex     : only one thread may touch buf/head/tail/count at a time
+ *   not_full  : producers sleep on this while the buffer is full
+ *   not_empty : the consumer sleeps on this while the buffer is empty
+ *   stopping  : set by logger_stop() to tell every thread to finish
+ */
 static struct {
     LogEntry       *buf;
     int             capacity, head, tail, count;
@@ -67,6 +81,7 @@ static void echo_line(const char *fmt, ...)
     va_end(ap);
 }
 
+/* Current wall-clock time as "YYYY-MM-DD HH:MM:SS.mmm" for each log line. */
 static void timestamp(char *out, size_t len)
 {
     struct timespec ts;
@@ -79,11 +94,22 @@ static void timestamp(char *out, size_t len)
 
 /* ---- consumer thread ---------------------------------------------------- */
 
+/*
+ * CONSUMER THREAD: repeatedly take the oldest entry out of the buffer and
+ * write it to the log file. Runs until logger_stop() asks it to stop AND
+ * the buffer has been completely drained, so no entry is ever lost.
+ */
 static void *consumer_main(void *arg)
 {
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&L.mutex);
+        /*
+         * Buffer empty -> sleep. pthread_cond_wait() atomically releases the mutex
+         * while sleeping and re-locks it on wake-up. It is a WHILE loop, not an
+         * if, because a thread can wake up spuriously or find the condition has
+         * changed again, so the condition must be re-checked after every wake-up.
+         */
         while (L.count == 0 && !L.stopping) {
             L.stats.empty_waits++;
             pthread_cond_wait(&L.not_empty, &L.mutex);
@@ -97,6 +123,7 @@ static void *consumer_main(void *arg)
         L.count--;
         int left = L.count;
         L.stats.consumed++;
+        /* one slot just became free -> wake ONE producer that may be waiting for it */
         pthread_cond_signal(&L.not_full);
         pthread_mutex_unlock(&L.mutex);
 
@@ -120,6 +147,10 @@ int logger_running(void)
     return L.running && L.owner_pid == getpid();
 }
 
+/*
+ * Open the log file, allocate the buffer and start the consumer thread.
+ * Called once by main() before any command runs.
+ */
 int logger_start(const char *path, int capacity, int echo)
 {
     if (L.running) {
@@ -148,6 +179,11 @@ int logger_start(const char *path, int capacity, int echo)
     L.stopping = 0;
     L.echo = echo;
     L.next_seq = 1;
+    /*
+     * Remember which process owns the logger. After fork() a child gets a copy
+     * of this struct but NOT the consumer thread, so children must never log
+     * (they would block forever on a full buffer nobody empties).
+     */
     L.owner_pid = getpid();
     memset(&L.stats, 0, sizeof L.stats);
     L.stats.capacity = capacity;
@@ -165,6 +201,11 @@ int logger_start(const char *path, int capacity, int echo)
 
 /* Producer side: blocks while the buffer is full. Returns 0, or -1 if the
  * logger is not running / is shutting down. */
+/*
+ * PRODUCER SIDE: any thread calls logger_log("SOURCE", "printf format", ...).
+ * The message is formatted BEFORE taking the lock (keeps the critical
+ * section short), then inserted at the tail of the buffer.
+ */
 int logger_log(const char *source, const char *fmt, ...)
 {
     if (!L.running || L.owner_pid != getpid())
@@ -184,6 +225,10 @@ int logger_log(const char *source, const char *fmt, ...)
         pthread_mutex_unlock(&L.mutex);
         return -1;
     }
+    /*
+     * Buffer full -> this producer sleeps on not_full until the consumer frees
+     * a slot. Again a while loop, for the same reason as in the consumer.
+     */
     while (L.count == L.capacity && !L.stopping) {
         L.stats.full_waits++;
         if (L.echo)
@@ -203,6 +248,7 @@ int logger_log(const char *source, const char *fmt, ...)
         L.stats.max_occupancy = L.count;
     L.stats.produced++;
     int now = L.count;
+    /* a new entry is available -> wake the consumer if it is sleeping */
     pthread_cond_signal(&L.not_empty);
     pthread_mutex_unlock(&L.mutex);
 
@@ -212,6 +258,14 @@ int logger_log(const char *source, const char *fmt, ...)
     return 0;
 }
 
+/*
+ * CLEAN SHUTDOWN:
+ *   1) set stopping = 1 under the mutex
+ *   2) broadcast BOTH condition variables so no thread stays asleep
+ *   3) pthread_join() waits until the consumer has drained the buffer and
+ *      returned - after this, only the main thread is left
+ *   4) close the file and free the buffer
+ */
 int logger_stop(LoggerStats *stats)
 {
     if (!L.running || L.owner_pid != getpid())
@@ -250,6 +304,10 @@ static const char *EVENT_KINDS[] = {
     "job completed", "lab node heartbeat"
 };
 
+/*
+ * PRODUCER THREAD used by the FR3 demo: logs p->events lab events, sleeping
+ * a small random time between them so the threads interleave realistically.
+ */
 static void *producer_main(void *arg)
 {
     ProducerArg *p = arg;
@@ -278,6 +336,10 @@ int logger_demo(int producers, int events, int capacity)
 
     if (logger_start(LOG_PATH, capacity, 1) != 0)
         return EXIT_RUNTIME;
+    /*
+     * The demo makes the consumer slightly slower than the producers on purpose,
+     * so the buffer really fills up and the 'queue FULL -> waiting' path is shown.
+     */
     L.consumer_delay_us = 3000;     /* slow consumer so the bounded buffer really fills */
 
     logger_log("main", "logger demo started: %d producers x %d events, capacity %d",
@@ -286,6 +348,7 @@ int logger_demo(int producers, int events, int capacity)
     pthread_t   tids[16];
     ProducerArg args[16];
     int created = 0;
+    /* create the producer threads; each gets its own ProducerArg */
     for (int i = 0; i < producers; i++) {
         args[i].index  = i + 1;
         args[i].events = events;
@@ -300,6 +363,10 @@ int logger_demo(int producers, int events, int capacity)
     printf("    [main      ] threads now running: %d (main + consumer + %d producers)\n",
            thread_count_self(), created);
 
+    /*
+     * Wait for every producer to finish (pthread_join), then stop the logger,
+     * which joins the consumer. Nothing is detached, so no thread is left behind.
+     */
     for (int i = 0; i < created; i++) {
         pthread_join(tids[i], NULL);
     }
@@ -310,6 +377,7 @@ int logger_demo(int producers, int events, int capacity)
     int rc = logger_stop(&st);
     printf("    [main      ] consumer thread joined\n");
 
+    /* Correctness check: every entry produced must have been written to the file. */
     long expected = (long)created * events + 2;      /* + the two "main" entries */
     printf("\n  Summary\n");
     printf("  -------\n");

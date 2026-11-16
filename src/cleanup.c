@@ -42,12 +42,17 @@ int no_children_left(void)
     return waitpid(-1, &st, WNOHANG) == -1 && errno == ECHILD;
 }
 
+/*
+ * kill(pid, 0) sends no signal; it only checks whether the process exists.
+ * EPERM means it exists but belongs to another user.
+ */
 static int pid_alive(int pid)
 {
     return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM);
 }
 
 /* extract the trailing _<pid> from an object name */
+/* Our IPC names end in _<pid of the creating run>; extract that number. */
 static int trailing_pid(const char *name)
 {
     const char *u = strrchr(name, '_');
@@ -56,6 +61,10 @@ static int trailing_pid(const char *name)
     return pid;
 }
 
+/*
+ * Look ONLY for things CampusCompute itself creates (names starting with
+ * 'campuscompute_'), never touching anyone else's files or IPC objects.
+ */
 int cleanup_check(int remove_stale)
 {
     print_banner("FR7 Cleanup verification");
@@ -78,6 +87,7 @@ int cleanup_check(int remove_stale)
             int owner = trailing_pid(nm);
             int alive = pid_alive(owner);
             printf("      %-45s owner pid %d %s\n", nm, owner, alive ? "(still running)" : "(STALE)");
+            /* creator process is gone but the object remains -> a leftover ('stale') */
             if (!alive) {
                 if (remove_stale) {
                     char path[300];
@@ -114,6 +124,10 @@ int cleanup_check(int remove_stale)
     /* 3. other campuscompute processes (scan /proc/<pid>/comm) */
     printf("  [3] Other running campuscompute processes:\n");
     int others = 0;
+    /*
+     * Every running process has a directory /proc/<pid>; its 'comm' file holds
+     * the program name. Any other 'campuscompute' process would be a leftover.
+     */
     d = opendir("/proc");
     if (d) {
         struct dirent *e;

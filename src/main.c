@@ -50,6 +50,7 @@ static void usage(FILE *out)
         DEFAULT_QUANTUM, LOG_PATH);
 }
 
+/* Print a specific error plus a hint, and return exit code 2 (invalid usage). */
 static int usage_error(const char *fmt, const char *arg)
 {
     fprintf(stderr, "error: ");
@@ -58,6 +59,7 @@ static int usage_error(const char *fmt, const char *arg)
     return EXIT_USAGE;
 }
 
+/* Check the number of arguments after the command name is within [min, max]. */
 static int need_args(int argc, int min, int max, const char *cmd, const char *synopsis)
 {
     if (argc - 1 < min || argc - 1 > max) {
@@ -69,6 +71,11 @@ static int need_args(int argc, int min, int max, const char *cmd, const char *sy
 }
 
 /* load jobs and run one or all schedulers */
+/*
+ * jobs / fcfs / rr / priority / compare: load + validate the job file first
+ * (bad file -> exit 2, nothing scheduled), then run the requested policy.
+ * 'static' arrays keep these large structs off the stack.
+ */
 static int cmd_schedule(const char *which, const char *path, int quantum)
 {
     static Job jobs[MAX_JOBS];
@@ -122,6 +129,10 @@ static int cmd_schedule(const char *which, const char *path, int quantum)
     return EXIT_OK;
 }
 
+/*
+ * Commands that run with the background logger active (see main()).
+ * Each checks its own arguments before doing anything.
+ */
 static int dispatch(int argc, char **argv)
 {
     const char *cmd = argv[0];
@@ -165,6 +176,10 @@ static int dispatch(int argc, char **argv)
     return usage_error("unknown command '%s'", cmd);
 }
 
+/*
+ * Entry point: './campuscompute <command> [arguments]'.
+ * Exit codes: 0 = success, 1 = runtime failure, 2 = invalid command or input.
+ */
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);      /* line-buffered: keeps parent/child output ordered */
@@ -183,6 +198,10 @@ int main(int argc, char **argv)
         return EXIT_OK;
     }
 
+    /*
+     * help, menu, logger, cleanup-check and demo manage their own setup, so they
+     * are handled here before the shared logger is started.
+     */
     if (!strcmp(cmd, "menu")) {
         if (sub_argc != 1) {
             fprintf(stderr, "error: 'menu' takes no arguments\nusage: ./campuscompute menu\n");
@@ -224,6 +243,12 @@ int main(int argc, char **argv)
     }
 
     /* All other commands record their events through the threaded logger. */
+    /*
+     * Every other command runs with the FR3 logger thread active, so its events
+     * (job state changes, IPC, Banker's, workers...) are recorded in
+     * logs/campuscompute.log. The logger is always stopped (thread joined)
+     * before the program exits.
+     */
     int logging = logger_start(LOG_PATH, 16, 0) == 0;
     if (!logging)
         fprintf(stderr, "warning: activity logging disabled for this run\n");

@@ -28,6 +28,11 @@
 /* ---- tiny tokenizer that skips '#' comments ------------------------------ */
 typedef struct { FILE *fp; int line; } Tok;
 
+/*
+ * Read the next word from the state file into 'out', skipping spaces, blank
+ * lines and '#' comments. Keeps a line counter so errors can name the line.
+ * Returns -1 at end of file.
+ */
 static int next_token(Tok *t, char *out, size_t len)
 {
     int c;
@@ -49,6 +54,10 @@ static int next_token(Tok *t, char *out, size_t len)
     return 0;
 }
 
+/*
+ * The next word must be exactly 'word' (e.g. "allocation"), otherwise report
+ * where the file went wrong.
+ */
 static int expect_word(Tok *t, const char *path, const char *word)
 {
     char tok[64];
@@ -63,6 +72,10 @@ static int expect_word(Tok *t, const char *path, const char *word)
     return 0;
 }
 
+/*
+ * The next word must be an integer in [min, max]; 'what' names the value in
+ * the error message, e.g. "Allocation[P1][R0]".
+ */
 static int expect_int(Tok *t, const char *path, const char *what, int min, int max, int *out)
 {
     char tok[64];
@@ -78,6 +91,11 @@ static int expect_int(Tok *t, const char *path, const char *what, int min, int m
     return 0;
 }
 
+/*
+ * Parse and validate a state file in a fixed order:
+ * processes n, resources m, available (m values), allocation (n x m), max (n x m).
+ * Any problem -> clear message with the line number and the file is rejected.
+ */
 int banker_load(const char *path, BankState *s)
 {
     memset(s, 0, sizeof *s);
@@ -117,6 +135,11 @@ int banker_load(const char *path, BankState *s)
         }
     }
     /* semantic check: a process can never hold more than it declared as maximum */
+    /*
+     * Semantic check + Need matrix. A process can never hold more than it
+     * declared as its maximum, so Allocation > Max is rejected.
+     * Need[i][j] = Max[i][j] - Allocation[i][j] = how much more Pi may still ask for.
+     */
     rc = 0;
     for (int i = 0; i < s->n; i++)
         for (int j = 0; j < s->m; j++) {
@@ -141,6 +164,7 @@ static void print_vec(const int *v, int m)
     printf(")");
 }
 
+/* Print the Available vector and the Allocation / Max / Need matrices. */
 void banker_print(const BankState *s)
 {
     printf("  Processes: %d   Resource types: %d\n", s->n, s->m);
@@ -159,6 +183,12 @@ void banker_print(const BankState *s)
     }
 }
 
+/*
+ * SAFETY ALGORITHM. Returns 1 if the state is safe, 0 if unsafe, and fills
+ * sequence[] with the order in which the processes can finish.
+ *   Work   = resources currently free (starts as Available)
+ *   Finish = which processes we have shown can complete
+ */
 int banker_check(const BankState *s, int *sequence, int verbose)
 {
     int work[BANK_MAX_R], finish[BANK_MAX_P] = {0}, count = 0;
@@ -170,11 +200,19 @@ int banker_check(const BankState *s, int *sequence, int verbose)
         printf(")\n");
     }
     int pass = 0, progress = 1;
+    /*
+     * Keep making passes over P0..Pn-1 while the previous pass let at least one
+     * process finish. When a pass makes no progress, nobody else can finish.
+     */
     while (progress && count < s->n) {
         progress = 0;
         pass++;
         for (int i = 0; i < s->n; i++) {
             if (finish[i]) continue;
+            /*
+             * Can Pi finish with what is free right now? Only if Need[i] <= Work in
+             * EVERY resource type.
+             */
             int fits = 1;
             for (int j = 0; j < s->m; j++)
                 if (s->need[i][j] > work[j]) { fits = 0; break; }
@@ -188,6 +226,10 @@ int banker_check(const BankState *s, int *sequence, int verbose)
                 if (verbose) printf("  -> must wait\n");
                 continue;
             }
+            /*
+             * Pi gets its remaining need, runs to completion and then RELEASES
+             * everything it holds, so its allocation becomes free for the others.
+             */
             for (int j = 0; j < s->m; j++) work[j] += s->alloc[i][j];
             finish[i] = 1;
             sequence[count++] = i;
@@ -200,6 +242,10 @@ int banker_check(const BankState *s, int *sequence, int verbose)
         }
     }
 
+    /*
+     * Safe if and only if every process could finish in some order. Unsafe does
+     * not mean deadlock has happened - only that it can no longer be ruled out.
+     */
     int safe = count == s->n;
     if (verbose) {
         if (safe) {
@@ -220,6 +266,10 @@ int banker_check(const BankState *s, int *sequence, int verbose)
     return safe;
 }
 
+/*
+ * 'banker <file>' command: load, print the matrices, run the check with a
+ * step-by-step trace, and record the verdict in the activity log.
+ */
 int banker_command(const char *path, int verbose)
 {
     BankState s;

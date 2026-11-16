@@ -38,6 +38,7 @@
 static struct termios saved_tio;
 static int raw_on = 0;
 
+/* Put the terminal back exactly as it was (line editing + echo on). */
 static void raw_off(void)
 {
     if (raw_on) {
@@ -48,6 +49,11 @@ static void raw_off(void)
     fflush(stdout);
 }
 
+/*
+ * 'Raw' input: turn off ICANON (line buffering) and ECHO so every key press
+ * reaches the program immediately and is not printed. VMIN=1: read() waits
+ * for at least one byte.
+ */
 static void raw_enable(void)
 {
     if (raw_on) return;                         /* keep queued key presses */
@@ -60,6 +66,10 @@ static void raw_enable(void)
     fputs("\033[?25l", stdout);                 /* hide cursor */
 }
 
+/*
+ * On Ctrl+C / kill: restore the terminal first, then let the signal do its
+ * default job, so the user's shell is never left in raw mode.
+ */
 static void on_signal(int sig)
 {
     raw_off();
@@ -103,6 +113,10 @@ static const Item ITEMS[] = {
 };
 #define NITEMS ((int)(sizeof ITEMS / sizeof ITEMS[0]))
 
+/*
+ * Redraw the whole menu. \033[2J\033[H clears the screen and moves the cursor
+ * home; the selected item is drawn in reverse video.
+ */
 static void draw(int sel)
 {
     printf("\033[2J\033[H");
@@ -124,6 +138,7 @@ static void draw(int sel)
 }
 
 /* Read one key; returns 'U' / 'D' for arrows, otherwise the character. */
+/* Arrow keys arrive as 3-byte escape sequences: ESC '[' 'A' (up) / 'B' (down). */
 static int read_key(void)
 {
     char c;
@@ -140,6 +155,10 @@ static int read_key(void)
 }
 
 /* Run "<self> args..." in a child process and report its exit status. */
+/*
+ * Run one feature: fork() a child that execv()s this same program with the
+ * feature's arguments, and wait for it with waitpid() in the parent.
+ */
 static int run_self(const char *self, char *const args[])
 {
     printf(C_CYAN C_BOLD "\n$ ./campuscompute");
@@ -252,6 +271,10 @@ static int menu_plain(const char *self)
     }
 }
 
+/*
+ * /proc/self/exe is a link to this program's own executable file, so the
+ * menu can start itself again with different arguments.
+ */
 int menu_run(void)
 {
     char self[4096];

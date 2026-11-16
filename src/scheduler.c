@@ -26,6 +26,10 @@
 
 /* ---- helpers ---------------------------------------------------------- */
 
+/*
+ * Start a fresh result: copy the caller's jobs so the original array is never
+ * changed, then put every copied job back into the NEW state.
+ */
 static void result_init(ScheduleResult *r, const char *name, const Job *jobs, int n)
 {
     memset(r, 0, sizeof *r);
@@ -43,6 +47,7 @@ static int add_slice(ScheduleResult *r, int job_id, int start, int end)
         return 0;
     if (r->nslices > 0) {
         Slice *last = &r->slices[r->nslices - 1];
+        /* Same job continuing right after itself -> just extend the last bar. */
         if (last->job_id == job_id && last->end == start) {
             last->end = end;
             return 0;
@@ -57,6 +62,10 @@ static int add_slice(ScheduleResult *r, int job_id, int start, int end)
 }
 
 /* Comparator: arrival time, then job ID. */
+/*
+ * qsort() only passes two pointers to the comparator, so the job array it
+ * needs to look at is kept in this file-level pointer while sorting.
+ */
 static const Job *g_sort_jobs;
 static int cmp_arrival_then_id(const void *a, const void *b)
 {
@@ -66,6 +75,10 @@ static int cmp_arrival_then_id(const void *a, const void *b)
     return x->id - y->id;
 }
 
+/*
+ * Build idx[] = job indices sorted by (arrival, ID). The jobs themselves are
+ * not moved; every policy walks this list to know who arrives next.
+ */
 static void order_by_arrival(const Job *jobs, int n, int *idx)
 {
     for (int i = 0; i < n; i++) idx[i] = i;
@@ -73,6 +86,11 @@ static void order_by_arrival(const Job *jobs, int n, int *idx)
     qsort(idx, (size_t)n, sizeof *idx, cmp_arrival_then_id);
 }
 
+/*
+ * Lifecycle step NEW -> READY: every job whose arrival time is <= t has
+ * "arrived", so mark it READY. *next remembers how far we got in the sorted
+ * arrival list, so each job is admitted exactly once.
+ */
 static void mark_ready_until(Job *jobs, const int *order, int n, int *next, int t,
                              const char *policy)
 {
@@ -84,6 +102,10 @@ static void mark_ready_until(Job *jobs, const int *order, int n, int *next, int 
     }
 }
 
+/*
+ * Lifecycle step READY -> RUNNING. The first time a job gets the CPU we
+ * record its start time; response time = first start - arrival.
+ */
 static void run_job(Job *j, int t, const char *policy)
 {
     if (j->start < 0) {
@@ -94,6 +116,11 @@ static void run_job(Job *j, int t, const char *policy)
     logger_log(policy, "t=%d J%d -> RUNNING", t, j->id);
 }
 
+/*
+ * Lifecycle step RUNNING -> COMPLETED, and the per-job metrics:
+ *   turnaround = completion - arrival   (total time in the system)
+ *   waiting    = turnaround - burst     (time spent ready but not running)
+ */
 static void complete_job(Job *j, int t, const char *policy)
 {
     j->completion = t;
@@ -116,6 +143,10 @@ static void finalize(ScheduleResult *r)
     r->avg_wt  = wt  / r->njobs;
     r->avg_rt  = rt  / r->njobs;
 
+    /*
+     * Walk the timeline: add up busy (non-idle) time, and count a context
+     * switch every time the CPU moves from one job to a different job.
+     */
     int prev = -1;
     r->busy_time = 0;
     r->context_switches = 0;
@@ -140,7 +171,9 @@ int schedule_fcfs(const Job *jobs, int n, ScheduleResult *r)
     order_by_arrival(r->jobs, n, order);
 
     int t = 0, next = 0;
+    /* FCFS: take jobs strictly in arrival order; each runs its whole burst. */
     for (int k = 0; k < n; k++) {
+        /* next job in arrival order (ties already broken by smaller ID) */
         Job *j = &r->jobs[order[k]];
         if (t < j->arrival) {                       /* nothing ready: CPU idle */
             if (add_slice(r, -1, t, j->arrival)) return -1;
@@ -148,6 +181,7 @@ int schedule_fcfs(const Job *jobs, int n, ScheduleResult *r)
         }
         mark_ready_until(r->jobs, order, n, &next, t, "FCFS");
         run_job(j, t, "FCFS");
+        /* the job holds the CPU for its entire burst - no preemption */
         if (add_slice(r, j->id, t, t + j->burst)) return -1;
         t += j->burst;
         j->remaining = 0;
@@ -174,12 +208,20 @@ int schedule_rr(const Job *jobs, int n, int quantum, ScheduleResult *r)
     int order[MAX_JOBS];
     order_by_arrival(r->jobs, n, order);
 
-    /* circular FIFO ready queue holding indices into r->jobs */
+    /*
+     * The ready queue is a circular array of indices into r->jobs: push at tail, pop at head.
+     * One extra slot lets 'head == tail' mean empty. A job is in the queue at
+     * most once, so MAX_JOBS + 1 slots can never overflow.
+     */
     int queue[MAX_JOBS + 1], head = 0, tail = 0;
 #define RQ_PUSH(x) do { queue[tail] = (x); tail = (tail + 1) % (MAX_JOBS + 1); } while (0)
 #define RQ_EMPTY() (head == tail)
 
     int t = 0, next = 0, done = 0;
+    /*
+     * Each loop iteration = one dispatch: admit arrivals, pick the job at the
+     * front of the queue, run it for min(quantum, remaining) time units.
+     */
     while (done < n) {
         /* admit everything that has arrived by time t */
         while (next < n && r->jobs[order[next]].arrival <= t) {
@@ -200,6 +242,7 @@ int schedule_rr(const Job *jobs, int n, int quantum, ScheduleResult *r)
         head = (head + 1) % (MAX_JOBS + 1);
         Job *j = &r->jobs[idx];
         run_job(j, t, "RR");
+        /* run a full quantum, or less if the job finishes sooner */
         int run = j->remaining < quantum ? j->remaining : quantum;
         if (add_slice(r, j->id, t, t + run)) return -1;
         t += run;
@@ -214,6 +257,10 @@ int schedule_rr(const Job *jobs, int n, int quantum, ScheduleResult *r)
             next++;
         }
 
+        /*
+         * Unfinished job is PREEMPTED and goes to the BACK of the queue; a finished
+         * job leaves the system.
+         */
         if (j->remaining > 0) {
             j->status = JOB_READY;
             logger_log("RR", "t=%d J%d quantum expired, %d left -> back of queue",
@@ -242,6 +289,12 @@ int schedule_priority(const Job *jobs, int n, ScheduleResult *r)
     while (done < n) {
         mark_ready_until(r->jobs, order, n, &next, t, "PRIORITY");
 
+        /*
+         * Scan all READY jobs and keep the 'best' one:
+         *   1) smaller priority number wins (lower number = higher priority)
+         *   2) equal priority -> earlier arrival wins
+         *   3) still equal    -> smaller job ID wins
+         */
         int best = -1;
         for (int i = 0; i < n; i++) {
             Job *c = &r->jobs[i];
@@ -260,6 +313,10 @@ int schedule_priority(const Job *jobs, int n, ScheduleResult *r)
             continue;
         }
 
+        /*
+         * Non-preemptive: the chosen job runs its whole burst. A higher-priority job
+         * that arrives meanwhile has to wait until this one finishes.
+         */
         Job *j = &r->jobs[best];
         run_job(j, t, "PRIORITY");
         if (add_slice(r, j->id, t, t + j->burst)) return -1;
@@ -277,6 +334,12 @@ int schedule_priority(const Job *jobs, int n, ScheduleResult *r)
 /* Print a text Gantt chart, wrapping every few slices so it fits a terminal. */
 static void print_gantt(const ScheduleResult *r)
 {
+    /*
+     * Draw two text lines per row of the chart:
+     *   |J1    |J2    |      <- one box per slice
+     *   0      5      8      <- start time of each slice, end time at the far right
+     * RR can produce many slices, so the chart wraps every 10 slices.
+     */
     const int per_row = 10;
     printf("  Gantt chart:\n");
     for (int base = 0; base < r->nslices; base += per_row) {
@@ -332,6 +395,10 @@ void schedule_print_comparison(const ScheduleResult *rs, int count)
     printf("\n  %-28s %8s %8s %8s %9s %8s\n", "Policy", "AvgTAT", "AvgWT", "AvgRT", "CtxSw", "Makespan");
     printf("  %-28s %8s %8s %8s %9s %8s\n", "----------------------------", "--------",
            "--------", "--------", "---------", "--------");
+    /*
+     * Remember which policy has the lowest value in each column (strict '<', so
+     * on a tie the policy listed first is kept).
+     */
     int best_wt = 0, best_tat = 0, best_rt = 0;
     for (int i = 0; i < count; i++) {
         printf("  %-28s %8.2f %8.2f %8.2f %9d %8d\n", rs[i].name, rs[i].avg_tat,
