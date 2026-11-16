@@ -142,6 +142,9 @@ int  cleanup_check(int remove_stale);
 int  thread_count_self(void);
 int  no_children_left(void);
 
+/* ---------- FR8: interactive terminal menu ---------- */
+int  menu_run(void);
+
 /* ---------- integrated demo ---------- */
 int  demo_run(const char *jobfile, const char *bankfile);
 

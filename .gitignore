@@ -3,4 +3,3 @@ campuscompute
 logs/
 *.zip
 *.o
-__pycache__/

@@ -39,6 +39,7 @@ static void usage(FILE *out)
         "  cleanup-check [--remove-stale]        verify no CampusCompute processes/IPC objects remain\n"
         "\n"
         "Other\n"
+        "  menu                                  interactive terminal menu (arrow keys + Enter)\n"
         "  demo     [jobfile] [statefile]        integrated end-to-end demonstration\n"
         "  help                                  show this message\n"
         "\n"
@@ -180,6 +181,14 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "help") || !strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
         usage(stdout);
         return EXIT_OK;
+    }
+
+    if (!strcmp(cmd, "menu")) {
+        if (sub_argc != 1) {
+            fprintf(stderr, "error: 'menu' takes no arguments\nusage: ./campuscompute menu\n");
+            return EXIT_USAGE;
+        }
+        return menu_run();
     }
 
     if (!strcmp(cmd, "logger")) {

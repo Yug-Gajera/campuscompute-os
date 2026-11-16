@@ -49,6 +49,7 @@ can be tested independently.
 | FR7 | `./campuscompute rlimit all` | RLIMIT_CPU, RLIMIT_FSIZE and RLIMIT_AS applied in children |
 | FR7 | `./campuscompute cleanup-check` | no leftover processes, shared memory, semaphores or temp files |
 | FR8 | `./campuscompute jobs tests/jobs_invalid.txt`, `./campuscompute xyz` | error and usage messages |
+| FR8 | `./campuscompute menu` | interactive terminal menu: arrow keys to choose, Enter to run |
 | All | `./campuscompute demo` | integrated run with PASS/FAIL summary |
 
 `make test` runs every feature once.
@@ -132,6 +133,7 @@ src/banker.c              FR5 Banker's safety algorithm
 src/workers.c             FR6 fork/waitpid worker supervision
 src/rlimit.c              FR7 setrlimit demonstrations
 src/cleanup.c             FR7 cleanup verification
+src/menu.c                FR8 interactive terminal menu (termios, fork/execv)
 src/demo.c                integrated demonstration
 src/util.c                helpers
 tests/                    repeatable input files
